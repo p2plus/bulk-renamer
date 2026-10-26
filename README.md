@@ -7,6 +7,8 @@ Explorer and Finder still can't do this properly in 2026. The existing tools
 are either abandonware, freemium nagware, or they rename your files before
 showing you the result. This one doesn't do any of that.
 
+![bulk-renamer web GUI: two rules, live preview, 6 renames planned](docs/screenshot-gui-preview.png)
+
 - **Dry-run by default.** Nothing moves until you pass `--apply` or click Apply.
 - **One-click undo.** Every apply writes a journal; `--undo` reverses it. No
   trash-bin magic, just the inverse operations.
@@ -38,6 +40,8 @@ bulk-renamer ~/Pictures/vacation --replace IMG vacation --apply
 # oops
 bulk-renamer ~/Pictures/vacation --undo
 ```
+
+![CLI dry-run output: 6 files mapped old to new](docs/screenshot-cli.png)
 
 Rules available:
 
@@ -98,9 +102,26 @@ nothing beyond the directory you point it at.
 - The undo journal is written *before* the first rename happens.
 - Renames that could collide mid-flight are staged through hidden temp names.
 
+![GUI refusing a plan: three red rows, Apply disabled](docs/screenshot-gui-problems.png)
+
 That said: it renames files on your disk. Preview first, and don't run it on
 the only copy of anything you care about. Same advice as for every renamer,
 including the ones that cost money.
+
+## HTTP API
+
+The GUI talks to the same server you can script against. All JSON, all on
+127.0.0.1:
+
+| Endpoint | Method | Purpose |
+| --- | --- | --- |
+| `/api/files?dir=…&filter=…&recursive=0\|1` | GET | list matching files |
+| `/api/plan` | POST | compute a plan, return rows + problems |
+| `/api/apply` | POST | apply a plan, write the undo journal |
+| `/api/undo` | POST | undo the last apply in a directory |
+
+Rule payloads are the same JSON objects the CLI's `--rules` file takes, e.g.
+`{"dir": "/tmp/x", "rules": [{"kind": "prefix", "text": "new_"}]}`.
 
 ## Development
 
