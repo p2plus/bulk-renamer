@@ -1,0 +1,286 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>bulk-renamer</title>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #171a21; --line: #2a2f3a;
+    --fg: #e6e9ef; --dim: #8b93a3; --accent: #4f9cf9;
+    --ok: #7bd88f; --bad: #f97583; --warn: #e2b93b;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 14px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  header { padding: 14px 18px; border-bottom: 1px solid var(--line); }
+  header h1 { margin: 0; font-size: 16px; font-weight: 600; }
+  header h1 span { color: var(--dim); font-weight: 400; }
+  main { max-width: 1100px; margin: 0 auto; padding: 18px; }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px; margin-bottom: 14px; }
+  label { color: var(--dim); font-size: 12px; }
+  input[type=text] {
+    background: var(--bg); color: var(--fg); border: 1px solid var(--line);
+    border-radius: 5px; padding: 6px 8px; font: inherit; width: 100%;
+  }
+  .row { display: flex; gap: 10px; align-items: end; flex-wrap: wrap; }
+  .row > div { flex: 1; min-width: 180px; }
+  .row > div.check { flex: 0; display: flex; gap: 6px; align-items: center; padding-bottom: 7px; }
+  table { width: 100%; border-collapse: collapse; }
+  th { text-align: left; color: var(--dim); font-size: 12px; padding: 6px 8px; border-bottom: 1px solid var(--line); }
+  td { padding: 5px 8px; border-bottom: 1px solid var(--line); word-break: break-all; }
+  td.arrow { color: var(--dim); width: 30px; }
+  tr.noop td { color: var(--dim); }
+  tr.problem td.target { color: var(--bad); }
+  .problems { color: var(--warn); font-size: 12px; }
+  button {
+    background: var(--panel); color: var(--fg); border: 1px solid var(--line);
+    border-radius: 5px; padding: 6px 14px; font: inherit; cursor: pointer;
+  }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #08101c; font-weight: 600; }
+  button.danger { border-color: var(--bad); color: var(--bad); }
+  button:disabled { opacity: .4; cursor: not-allowed; }
+  .btnbar { display: flex; gap: 10px; align-items: center; }
+  #status { color: var(--dim); }
+  #status.err { color: var(--bad); }
+  .rule { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; flex-wrap: wrap; }
+  .rule select, .rule input {
+    background: var(--bg); color: var(--fg); border: 1px solid var(--line);
+    border-radius: 5px; padding: 5px 7px; font: inherit;
+  }
+  .rule input { width: 110px; }
+  .rule .kind { width: 120px; }
+  .rule .hint { color: var(--dim); font-size: 12px; flex: 1; }
+  .rule button { padding: 2px 8px; }
+  #rules-empty { color: var(--dim); font-size: 12px; }
+  summary { cursor: pointer; color: var(--dim); }
+  pre { background: var(--bg); border: 1px solid var(--line); border-radius: 5px; padding: 10px; overflow-x: auto; }
+</style>
+</head>
+<body>
+<header><h1>bulk-renamer <span>— preview first, undo always</span></h1></header>
+<main>
+  <div class="panel">
+    <div class="row">
+      <div><label>Directory</label><input type="text" id="dir" placeholder="/path/to/folder"></div>
+      <div style="max-width:200px"><label>File filter (glob)</label><input type="text" id="filter" value="*"></div>
+      <div class="check"><input type="checkbox" id="recursive"><label for="recursive">recursive</label></div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div id="rules-list"><div id="rules-empty">No rules yet — add one below.</div></div>
+    <div class="rule">
+      <select class="kind" id="new-kind">
+        <option value="replace">replace</option><option value="regex">regex</option>
+        <option value="prefix">prefix</option><option value="suffix">suffix</option>
+        <option value="insert">insert</option><option value="remove">remove</option>
+        <option value="case">case</option><option value="extension">extension</option>
+        <option value="sanitize">sanitize</option><option value="number">number</option>
+      </select>
+      <button id="add-rule">+ add rule</button>
+      <span class="hint" id="kind-hint"></span>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="btnbar">
+      <button class="primary" id="apply" disabled>Apply</button>
+      <button class="danger" id="undo">Undo last</button>
+      <span id="status">idle</span>
+    </div>
+  </div>
+
+  <div class="panel" id="preview-panel" style="display:none">
+    <table>
+      <thead><tr><th>current</th><th></th><th>new</th></tr></thead>
+      <tbody id="preview"></tbody>
+    </table>
+  </div>
+
+  <details>
+    <summary>API examples (rules JSON)</summary>
+<pre>[
+  {"kind": "replace", "find": "IMG", "replace_with": "vacation"},
+  {"kind": "number", "template": "{name}_{i:03d}", "start": 1, "step": 1}
+]</pre>
+  </details>
+</main>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+
+const RULE_FIELDS = {
+  replace:   [["find","find"],["replace_with","replace with"],["regex","regex? (1/0)"]],
+  regex:     [["pattern","pattern"],["replace_with","replace with"]],
+  prefix:    [["text","text"]],
+  suffix:    [["text","text"]],
+  insert:    [["text","text"],["position","position"]],
+  remove:    [["start","start"],["count","count"]],
+  case:      [["mode","lower|upper|title|sentence"]],
+  extension: [["ext","new extension (empty = strip)"]],
+  sanitize:  [],
+  number:    [["template","{name}_{i:03d}"],["start","start"],["step","step"]],
+};
+const RULE_HINTS = {
+  replace: "literal find & replace", regex: "regular expression replace",
+  prefix: "prepend text", suffix: "append text before extension",
+  insert: "insert text at position", remove: "delete characters",
+  case: "whole-name case", extension: "change or strip extension",
+  sanitize: "replace illegal characters with _",
+  number: "number using {name} and {i}; files sorted naturally (file2 < file10)",
+};
+
+let rules = [];
+let debounce = null;
+
+function setStatus(msg, err) {
+  $("status").textContent = msg;
+  $("status").className = err ? "err" : "";
+}
+
+function renderRules() {
+  const list = $("rules-list");
+  list.innerHTML = "";
+  if (!rules.length) {
+    list.innerHTML = '<div id="rules-empty">No rules yet — add one below.</div>';
+    return;
+  }
+  rules.forEach((r, i) => {
+    const div = document.createElement("div");
+    div.className = "rule";
+    const name = document.createElement("span");
+    name.textContent = `${i + 1}. ${r.kind}`;
+    name.style.color = "var(--accent)";
+    div.appendChild(name);
+    (RULE_FIELDS[r.kind] || []).forEach(([key, label]) => {
+      const inp = document.createElement("input");
+      inp.placeholder = label;
+      inp.value = r[key] ?? "";
+      inp.oninput = () => {
+        const raw = inp.value;
+        r[key] = /^\d+$/.test(raw) && key !== "template" && key !== "mode"
+          ? Number(raw) : raw;
+        if (key === "regex") r[key] = raw === "1";
+        schedulePlan();
+      };
+      div.appendChild(inp);
+    });
+    const up = document.createElement("button"); up.textContent = "↑";
+    up.onclick = () => { if (i > 0) { [rules[i-1], rules[i]] = [rules[i], rules[i-1]]; renderRules(); schedulePlan(); } };
+    const down = document.createElement("button"); down.textContent = "↓";
+    down.onclick = () => { if (i < rules.length-1) { [rules[i+1], rules[i]] = [rules[i], rules[i+1]]; renderRules(); schedulePlan(); } };
+    const del = document.createElement("button"); del.textContent = "✕";
+    del.onclick = () => { rules.splice(i, 1); renderRules(); schedulePlan(); };
+    div.append(up, down, del);
+    list.appendChild(div);
+  });
+}
+
+async function api(path, body) {
+  const res = await fetch(path, body ? {
+    method: "POST", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify(body),
+  } : undefined);
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || res.statusText);
+  return data;
+}
+
+function planPayload() {
+  return {
+    dir: $("dir").value.trim(), filter: $("filter").value.trim() || "*",
+    recursive: $("recursive").checked, rules,
+  };
+}
+
+function schedulePlan() { clearTimeout(debounce); debounce = setTimeout(refreshPlan, 300); }
+
+async function refreshPlan() {
+  const p = planPayload();
+  if (!p.dir || !rules.length) {
+    $("preview-panel").style.display = "none";
+    $("apply").disabled = true;
+    setStatus("waiting for directory and rules");
+    return;
+  }
+  try {
+    const data = await api("/api/plan", p);
+    renderPreview(data);
+  } catch (e) { setStatus(e.message, true); $("apply").disabled = true; }
+}
+
+function renderPreview(data) {
+  const tb = $("preview");
+  tb.innerHTML = "";
+  for (const row of data.rows) {
+    if (row.status === "noop") continue;
+    const tr = document.createElement("tr");
+    tr.className = row.problems.length ? "problem" : "";
+    tr.innerHTML = `<td>${esc(row.source)}</td><td class="arrow">→</td>` +
+      `<td class="target">${esc(row.target)}` +
+      (row.problems.length ? `<div class="problems">${esc(row.problems.join("; "))}</div>` : "") +
+      `</td>`;
+    tb.appendChild(tr);
+  }
+  $("preview-panel").style.display = "block";
+  const bad = data.problems > 0;
+  $("apply").disabled = bad || data.changes === 0;
+  setStatus(`${data.changes} rename(s), ${data.problems} problem(s)`,
+            bad);
+}
+
+const esc = (s) => s.replace(/[&<>"]/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+
+$("add-rule").onclick = () => {
+  const kind = $("new-kind").value;
+  const r = { kind };
+  (RULE_FIELDS[kind] || []).forEach(([key, label]) => {
+    if (key === "regex") r[key] = false;
+    else if (key === "mode") r[key] = "lower";
+    else if (key === "template") r[key] = "{name}_{i:03d}";
+    else if (["position","start","count","step"].includes(key)) r[key] = 0;
+    else if (key === "replace_with") r[key] = "";
+    else r[key] = "";
+  });
+  if (kind === "remove") r.count = 1;
+  if (kind === "insert") r.position = 0;
+  if (kind === "number") { r.start = 1; r.step = 1; }
+  if (kind === "extension") r.ext = "";
+  rules.push(r);
+  renderRules(); schedulePlan();
+};
+$("new-kind").onchange = () => {
+  $("kind-hint").textContent = RULE_HINTS[$("new-kind").value] || "";
+};
+$("dir").oninput = schedulePlan;
+$("filter").oninput = schedulePlan;
+$("recursive").onchange = schedulePlan;
+
+$("apply").onclick = async () => {
+  const p = planPayload();
+  const data = await api("/api/plan", p);
+  if (!confirm(`Rename ${data.changes} file(s) in ${p.dir}?`)) return;
+  try {
+    const res = await api("/api/apply", p);
+    setStatus(`applied ${res.applied} rename(s) — undo available`);
+    refreshPlan();
+  } catch (e) { setStatus(e.message, true); }
+};
+
+$("undo").onclick = async () => {
+  if (!confirm("Undo the last apply in this directory?")) return;
+  try {
+    const res = await api("/api/undo", { dir: $("dir").value.trim() });
+    setStatus(`undone ${res.undone} rename(s)`);
+    refreshPlan();
+  } catch (e) { setStatus(e.message, true); }
+};
+
+setStatus("waiting for directory and rules");
+</script>
+</body>
+</html>

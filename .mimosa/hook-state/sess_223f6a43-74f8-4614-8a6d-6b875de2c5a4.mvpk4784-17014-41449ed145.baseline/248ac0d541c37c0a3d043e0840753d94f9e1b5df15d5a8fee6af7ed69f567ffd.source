@@ -1,0 +1,362 @@
+"""Core renaming engine: rules, plan computation, safe two-phase apply, undo.
+
+The engine is pure logic with no I/O beyond filesystem renames, so the CLI,
+the web GUI, and the tests all share one code path.
+"""
+from __future__ import annotations
+
+import json
+import re
+import uuid
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from fnmatch import fnmatch
+from pathlib import Path
+from typing import Any
+
+JOURNAL_NAME = ".bulk-renamer-undo.json"
+JOURNAL_VERSION = 1
+
+#: Characters illegal in Windows filenames — rejecting them keeps results portable.
+ILLEGAL_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+
+RULE_KINDS = (
+    "replace", "regex", "prefix", "suffix", "insert",
+    "remove", "case", "extension", "sanitize", "number",
+)
+
+
+class RuleError(ValueError):
+    """A rule is malformed (bad regex, unknown kind, bad template, ...)."""
+
+
+class PlanError(ValueError):
+    """A plan cannot be applied (conflicts, collisions, empty names)."""
+
+
+def natural_key(name: str) -> tuple:
+    """Sort key treating digit runs as numbers: file2 < file10."""
+    return tuple(
+        (0, int(p)) if p.isdigit() else (1, p.lower())
+        for p in re.split(r"(\d+)", name)
+    )
+
+
+@dataclass(frozen=True)
+class Rule:
+    """One transformation step applied to every filename stem in order."""
+
+    kind: str
+    params: dict = field(default_factory=dict)
+
+    def __post_init__(self):
+        if self.kind not in RULE_KINDS:
+            raise RuleError(
+                f"unknown rule kind {self.kind!r} (known: {', '.join(RULE_KINDS)})"
+            )
+
+    def to_json(self) -> dict:
+        return {"kind": self.kind, **self.params}
+
+    @classmethod
+    def from_json(cls, obj: dict) -> "Rule":
+        obj = dict(obj)
+        kind = obj.pop("kind", None)
+        if not kind:
+            raise RuleError("rule object missing 'kind'")
+        return cls(kind, obj)
+
+    # `ext` arrives pre-split so the extension rule can rewrite it in place;
+    # `index` is the file's 0-based position in the plan's natural sort order.
+    def apply(self, stem: str, ext: str, index: int) -> tuple[str, str]:
+        p = self.params
+        k = self.kind
+        if k == "replace":
+            find, repl = str(p.get("find", "")), str(p.get("replace_with", ""))
+            if not find:
+                raise RuleError("replace: 'find' must not be empty")
+            if p.get("regex"):
+                try:
+                    return re.sub(find, repl, stem), ext
+                except re.error as e:
+                    raise RuleError(f"replace/regex: {e}") from e
+            return stem.replace(find, repl), ext
+        if k == "regex":
+            pattern, repl = str(p.get("pattern", "")), str(p.get("replace_with", ""))
+            try:
+                return re.sub(pattern, repl, stem), ext
+            except re.error as e:
+                raise RuleError(f"regex: {e}") from e
+        if k == "prefix":
+            return str(p.get("text", "")) + stem, ext
+        if k == "suffix":
+            return stem + str(p.get("text", "")), ext
+        if k == "insert":
+            text, pos = str(p.get("text", "")), int(p.get("position", 0))
+            if pos >= 0:
+                pos = min(pos, len(stem))
+            else:
+                pos = max(0, len(stem) + pos)
+            return stem[:pos] + text + stem[pos:], ext
+        if k == "remove":
+            start, count = int(p.get("start", 0)), int(p.get("count", 1))
+            if count < 0:
+                raise RuleError("remove: 'count' must be >= 0")
+            if start < 0:
+                start = max(0, len(stem) + start)
+            return stem[:start] + stem[start + count:], ext
+        if k == "case":
+            mode = str(p.get("mode", "lower"))
+            if mode == "lower":
+                return stem.lower(), ext
+            if mode == "upper":
+                return stem.upper(), ext
+            if mode == "title":
+                return stem.title(), ext
+            if mode == "sentence":
+                return (stem[:1].upper() + stem[1:].lower()) if stem else stem, ext
+            raise RuleError(f"case: unknown mode {mode!r} (lower|upper|title|sentence)")
+        if k == "extension":
+            new_ext = str(p.get("ext", "")).lstrip(".")
+            return stem, ("." + new_ext if new_ext else "")
+        if k == "sanitize":
+            repl = str(p.get("replacement", "_"))
+            stem = ILLEGAL_CHARS.sub(repl, stem).strip(" .")
+            ext = ILLEGAL_CHARS.sub(repl, ext).rstrip(" .")
+            return stem, ext
+        if k == "number":
+            template = str(p.get("template", "{name}_{i:03d}"))
+            start, step = int(p.get("start", 1)), int(p.get("step", 1))
+            try:
+                # Validate the template once with throwaway values.
+                template.format(name="x", i=0)
+            except (KeyError, IndexError, ValueError) as e:
+                raise RuleError(f"number: bad template {template!r} ({e})") from e
+            if "{name}" not in template and "{i" not in template:
+                raise RuleError("number: template must contain {name} and/or {i}")
+            return template.format(name=stem, i=start + index * step), ext
+        raise RuleError(f"unknown rule kind {self.kind!r}")  # pragma: no cover
+
+
+@dataclass
+class PlanItem:
+    source: Path
+    target: Path
+    status: str = "rename"  # "rename" | "noop"
+    problems: list = field(default_factory=list)
+
+
+@dataclass
+class RenamePlan:
+    root: Path
+    rules: list
+    items: list
+
+    @property
+    def changes(self) -> list:
+        return [i for i in self.items if i.status == "rename"]
+
+    @property
+    def problem_count(self) -> int:
+        return sum(len(i.problems) for i in self.items)
+
+    def rows(self) -> list:
+        """Serializable rows for CLI --json and the web GUI."""
+        return [
+            {
+                "source": str(i.source.relative_to(self.root)),
+                "target": str(i.target.relative_to(self.root)),
+                "status": i.status,
+                "problems": list(i.problems),
+            }
+            for i in self.items
+        ]
+
+    @classmethod
+    def build(
+        cls,
+        root: Path,
+        rules: list,
+        file_filter: str = "*",
+        recursive: bool = False,
+    ) -> "RenamePlan":
+        root = Path(root).resolve()
+        if not root.is_dir():
+            raise PlanError(f"not a directory: {root}")
+        if not rules:
+            raise PlanError("no rules given — nothing to do")
+
+        # Validate every rule once up front so a bad regex/template fails even
+        # when the directory turns out to contain no matching files.
+        for rule in rules:
+            rule.apply("validation", ".tmp", 0)
+
+        it = root.rglob("*") if recursive else root.iterdir()
+        files = sorted(
+            (f for f in it if f.is_file() and fnmatch(f.name, file_filter)),
+            key=lambda f: (str(f.parent), natural_key(f.name)),
+        )
+
+        items = []
+        for idx, f in enumerate(files):
+            stem, ext = f.stem, f.suffix
+            for rule in rules:
+                stem, ext = rule.apply(stem, ext, idx)
+            target = f.with_name(stem + ext)
+            item = PlanItem(source=f, target=target)
+            if target.name == f.name:
+                item.status = "noop"
+            else:
+                if not stem or not target.name or target.name in (".", ".."):
+                    item.problems.append("target name would be empty")
+                elif ILLEGAL_CHARS.search(target.name):
+                    item.problems.append("target name contains illegal characters")
+            items.append(item)
+
+        cls._mark_duplicate_targets(items)
+        cls._mark_collisions(items)
+        return cls(root=root, rules=rules, items=items)
+
+    @staticmethod
+    def _mark_duplicate_targets(items: list) -> None:
+        seen: dict = {}
+        for it in items:
+            key = (str(it.target.parent), it.target.name.lower())
+            seen.setdefault(key, []).append(it)
+        for group in seen.values():
+            if len(group) > 1:
+                names = ", ".join(f"'{i.source.name}'" for i in group)
+                for it in group:
+                    it.problems.append(f"conflicts with other renames: {names}")
+
+    @staticmethod
+    def _mark_collisions(items: list) -> None:
+        sources = {i.source for i in items}
+        for it in items:
+            if it.status == "noop":
+                continue
+            # A target that is some other item's source is a chain/swap, not a collision.
+            if it.target.exists() and it.target not in sources:
+                it.problems.append(f"target already exists: {it.target.name}")
+
+    # ---------------------------------------------------------------- apply
+
+    def apply(self, journal_path: Path | None = None) -> list:
+        """Apply all renames. Refuses if any item has problems.
+
+        Writes the undo journal before touching anything. Renames that would
+        collide mid-flight (chains, swaps, existing targets that are sources)
+        go through hidden temporary names first, so any order of operations
+        is safe. Returns the applied operations.
+        """
+        if self.problem_count:
+            raise PlanError(
+                "plan has problems, refusing to apply:\n"
+                + "\n".join(
+                    f"  {i.source.name}: {', '.join(i.problems)}"
+                    for i in self.items if i.problems
+                )
+            )
+        ops = [(i.source, i.target) for i in self.changes]
+        if not ops:
+            return []
+
+        journal_path = Path(journal_path) if journal_path else self.root / JOURNAL_NAME
+        _write_journal(journal_path, self.root, ops)
+
+        needs_two_phase = any(dst.exists() for _, dst in ops) or _has_cycles(ops)
+        if needs_two_phase:
+            tmp = _phase_one(ops)
+            _phase_two(tmp, journal_path)
+        else:
+            for src, dst in ops:
+                src.rename(dst)
+        return ops
+
+    @staticmethod
+    def undo(journal_path: Path) -> list:
+        """Reverse a previously applied journal, then remove it."""
+        journal_path = Path(journal_path)
+        if not journal_path.is_file():
+            raise FileNotFoundError(f"no undo journal at {journal_path}")
+        data = json.loads(journal_path.read_text(encoding="utf-8"))
+        if data.get("version") != JOURNAL_VERSION:
+            raise PlanError(f"unsupported journal version: {data.get('version')}")
+        root = Path(data["root"])
+        ops = [
+            (root / op["to"], root / op["from"]) for op in reversed(data["operations"])
+        ]
+        if not ops:
+            journal_path.unlink()
+            return []
+
+        needs_two_phase = any(dst.exists() for _, dst in ops) or _has_cycles(ops)
+        if needs_two_phase:
+            tmp = _phase_one(ops)
+            _phase_two(tmp, None)
+        else:
+            for src, dst in ops:
+                src.rename(dst)
+        journal_path.unlink()
+        return ops
+
+
+# ------------------------------------------------------------------ helpers
+
+def _has_cycles(ops: list) -> bool:
+    sources = {s for s, _ in ops}
+    return any(dst in sources for _, dst in ops)
+
+
+def _temp_name(p: Path) -> Path:
+    while True:
+        cand = p.with_name(f".bulkren-{uuid.uuid4().hex[:12]}")
+        if not cand.exists():
+            return cand
+
+
+def _phase_one(ops: list) -> list:
+    """Rename every moving file to a unique hidden temp name."""
+    tmp = []
+    for src, dst in ops:
+        t = _temp_name(src)
+        src.rename(t)
+        tmp.append((t, dst))
+    return tmp
+
+
+def _phase_two(tmp: list, journal_path: Path | None) -> None:
+    """Move temp names to their final targets."""
+    for t, dst in tmp:
+        try:
+            t.rename(dst)
+        except Exception:
+            # Leave the journal in place so `undo` can recover.
+            raise PlanError(
+                f"rename failed at {t.name} -> {dst.name}; "
+                f"run `bulk-renamer --undo` to recover"
+            )
+
+
+def _write_journal(journal_path: Path, root: Path, ops: list) -> None:
+    data = {
+        "version": JOURNAL_VERSION,
+        "created": datetime.now(timezone.utc).isoformat(),
+        "root": str(root),
+        "operations": [
+            {"from": str(s.relative_to(root)), "to": str(d.relative_to(root))}
+            for s, d in ops
+        ],
+    }
+    journal_path.write_text(json.dumps(data, indent=1), encoding="utf-8")
+
+
+def load_rules_file(path: Path) -> list:
+    """Load a JSON rules file: a list of {"kind": ..., param: value, ...}."""
+    try:
+        raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        raise RuleError(f"{path}: invalid JSON ({e})") from e
+    if not isinstance(raw, list):
+        raise RuleError(f"{path}: expected a JSON list of rules")
+    return [Rule.from_json(obj) for obj in raw]
